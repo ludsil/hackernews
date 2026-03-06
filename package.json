@@ -1,0 +1,9 @@
+{
+  "name": "ai-hackernews",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "docker:up": "docker-compose -f docker/docker-compose.yml up -d",
+    "docker:down": "docker-compose -f docker/docker-compose.yml down"
+  }
+}
