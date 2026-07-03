@@ -46,8 +46,18 @@ CREATE TRIGGER trigger_update_scraped_at
     EXECUTE FUNCTION update_scraped_at();
 `;
 
+function resolveConnectionString(): string | undefined {
+  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
+  const { DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME } = process.env;
+  if (DB_HOST && DB_USER && DB_PASSWORD && DB_NAME) {
+    const port = DB_PORT || '5432';
+    return `postgresql://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASSWORD)}@${DB_HOST}:${port}/${DB_NAME}`;
+  }
+  return undefined;
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: resolveConnectionString(),
   max: 20,
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 2000,

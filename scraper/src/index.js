@@ -1,3 +1,4 @@
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
 const { HNClient } = require('./hn-client');
 const { OpenAIClient } = require('./openai-client');
 const { ImageScraper } = require('./image-scraper');
@@ -5,26 +6,62 @@ const { S3ClientWrapper } = require('./s3-client');
 const { DBClient } = require('./db-client');
 const { logger } = require('./logger');
 
-// Environment variables validation
-const requiredEnvVars = [
-  'OPENAI_API_KEY',
-  'DATABASE_URL',
-  'AWS_REGION',
-  'S3_BUCKET_NAME',
-];
+// --- Configuration resolution -------------------------------------------------
+// Supports both a plain .env-style config (DATABASE_URL, S3_BUCKET_NAME,
+// OPENAI_API_KEY) for local dev, and spawned's injected env vars in production
+// (DB_* from Function->Database, S3_BUCKET from Function->Bucket, and a secret
+// ARN from Function->Secret).
 
+// Derive DATABASE_URL from spawned's Function->Database env vars if not set.
+function resolveDatabaseUrl() {
+  if (process.env.DATABASE_URL) return process.env.DATABASE_URL;
+  const { DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME } = process.env;
+  if (DB_HOST && DB_USER && DB_PASSWORD && DB_NAME) {
+    const port = DB_PORT || '5432';
+    return `postgresql://${encodeURIComponent(DB_USER)}:${encodeURIComponent(DB_PASSWORD)}@${DB_HOST}:${port}/${DB_NAME}`;
+  }
+  return undefined;
+}
+
+if (!process.env.DATABASE_URL) {
+  const derived = resolveDatabaseUrl();
+  if (derived) process.env.DATABASE_URL = derived;
+}
+
+// spawned's Function->Bucket injects <NAME>_BUCKET (S3_BUCKET); the app reads S3_BUCKET_NAME.
+if (!process.env.S3_BUCKET_NAME && process.env.S3_BUCKET) {
+  process.env.S3_BUCKET_NAME = process.env.S3_BUCKET;
+}
+
+// Fetch the OpenAI API key at runtime. spawned's Function->Secret connection
+// injects only the secret's ARN (OPENAI_SECRET_ARN) — Lambda has no native
+// secret-value injection, so we read it with the SDK.
+async function resolveOpenAiKey() {
+  if (process.env.OPENAI_API_KEY) return process.env.OPENAI_API_KEY;
+  const arn = process.env.OPENAI_SECRET_ARN;
+  if (!arn) return undefined;
+  const sm = new SecretsManagerClient({ region: process.env.AWS_REGION });
+  const res = await sm.send(new GetSecretValueCommand({ SecretId: arn }));
+  try {
+    const parsed = JSON.parse(res.SecretString || '{}');
+    return parsed.api_key || parsed.OPENAI_API_KEY || undefined;
+  } catch {
+    // Secret stored as a raw string rather than JSON.
+    return res.SecretString || undefined;
+  }
+}
+
+// Environment variables validation (OPENAI_API_KEY is resolved at runtime).
+const requiredEnvVars = ['DATABASE_URL', 'AWS_REGION', 'S3_BUCKET_NAME'];
 for (const envVar of requiredEnvVars) {
   if (!process.env[envVar]) {
     throw new Error(`Missing required environment variable: ${envVar}`);
   }
 }
 
-// Initialize clients
+// Initialize clients (openaiClient is created in the handler once the key resolves).
 const hnClient = new HNClient();
-const openaiClient = new OpenAIClient(
-  process.env.OPENAI_API_KEY,
-  process.env.OPENAI_BASE_URL
-);
+let openaiClient = null;
 const imageScraper = new ImageScraper();
 const s3Client = new S3ClientWrapper(
   process.env.AWS_REGION,
@@ -34,6 +71,14 @@ const s3Client = new S3ClientWrapper(
   process.env.S3_ENDPOINT
 );
 const dbClient = new DBClient(process.env.DATABASE_URL);
+
+// Fallback summary used when no OpenAI client is available.
+function fallbackSummary(story) {
+  return {
+    summary: `${story.title} - Visit the article for more details.`,
+    tags: ['general', 'tech', 'hackernews'],
+  };
+}
 
 async function processArticle(story) {
   const articleLogger = logger.child({ hn_id: story.id });
@@ -67,8 +112,10 @@ async function processArticle(story) {
       }
     }
 
-    // Summarize article with OpenAI
-    const summaryResponse = await openaiClient.summarizeArticle(story.title, story.url);
+    // Summarize article with OpenAI (fall back if no key is configured)
+    const summaryResponse = openaiClient
+      ? await openaiClient.summarizeArticle(story.title, story.url)
+      : fallbackSummary(story);
 
     // Upsert to database
     await dbClient.upsertArticle({
@@ -99,6 +146,20 @@ async function processArticle(story) {
 
 async function handler(_event, _context) {
   logger.info('Starting scraper');
+
+  // Resolve the OpenAI key at runtime (from Secrets Manager in production).
+  try {
+    const openAiKey = await resolveOpenAiKey();
+    if (openAiKey) {
+      openaiClient = new OpenAIClient(openAiKey, process.env.OPENAI_BASE_URL);
+    } else {
+      logger.warn('No OpenAI API key resolved; articles will be stored with fallback summaries');
+    }
+  } catch (error) {
+    logger.warn('Failed to resolve OpenAI API key; using fallback summaries', {
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
 
   let scrapeRunId;
   let articlesProcessed = 0;
